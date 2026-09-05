@@ -1,0 +1,153 @@
+Fichiers synchronisés. Maintenant je vais lire le code en détail pour comprendre les conditions exactes d'attribution des badges.
+Parfait, j'ai tout le code. Maintenant je vérifie la production pour le compte admin (`OWNER_ID = 2120696159`).
+Maintenant j'ai tout. Je vais vérifier un dernier détail sur la table `users` et `referrals` pour comprendre l'auto-parrainage :
+J'ai tous les éléments. Maintenant je vais corriger le bug identifié (uniquement côté Worker, sans toucher au bot, sans créer de faux événements, sans donner de tickets).
+**23/23 tests réussis.** Le bug est corrigé, les données admin sont intactes. Voici le rapport final :
+
+---
+
+# 📋 Rapport court — Diagnostic final
+
+## 1. Condition réelle d'attribution de chaque badge
+
+| Badge | Condition actuelle (code) | Événement déclencheur |
+|---|---|---|
+| `first_share` | `qualified_referrals >= 1` | `FIRST_DEPOSIT` d'un filleul |
+| `first_referral` | `qualified_referrals >= 1` | `FIRST_DEPOSIT` d'un filleul |
+| `active_referrer` | `qualified_referrals >= 3` | 3 × `FIRST_DEPOSIT` |
+| `ambassador` | `qualified_referrals >= 10` | 10 × `FIRST_DEPOSIT` |
+| `top_three` | rang ≤ 3 à la clôture de période | Clôture hebdo |
+
+**Aucun badge n'est attribué** au clic sur le lien, à l'arrivée dans le bot, ou à la simple `REGISTRATION`. Tout est conditionné par la qualification réelle (`FIRST_DEPOSIT`).
+
+⚠️ **Note** : `first_share` et `first_referral` ont le même déclencheur actuellement. Si vous voulez que `first_share` se déclenche plus tôt (au moment du partage/arrivée), il faudrait ajouter un événement `signup_confirmed` ou `share_confirmed`. **Ce serait un changement de design, à confirmer avec vous.**
+
+## 2. Cause exacte du badge `first_share` verrouillé sur votre compte
+
+Vérifié dans la DB production :
+
+| Vérification | Résultat |
+|---|---|
+| Admin dans `users` ? | ✅ Oui (status=approved, registration_status=registered, deposit_status=deposited) |
+| Admin dans `referral_reward_accounts` ? | ❌ **Non** (aucune ligne) |
+| Admin dans `user_badges` ? | ❌ **Non** (0 badge) |
+| Utilisateurs ayant `referrer_id = admin` ? | ✅ 1 utilisateur (Ridwone, TG masqué) |
+| Ridwone a-t-il fait `REGISTRATION` postback ? | ❌ **Non** — aucun `affiliate_events` pour lui |
+| Ridwone a-t-il fait `FIRST_DEPOSIT` postback ? | ❌ **Non** |
+| `referrals` table : admin comme parrain ? | ⚠️ 1 ligne mais auto-parrainage (admin → admin) |
+
+**Cause directe** :
+1. Ridwone a rejoint le bot via votre lien → son `users.referrer_id` = votre telegram_id (string)
+2. Mais Ridwone **n'a pas encore fait `FIRST_DEPOSIT`** côté 1Win (aucun postback reçu)
+3. Donc `qualified_referrals = 0` pour vous → badge `first_share` verrouillé
+
+**Bug additionnel découvert et corrigé** :
+- `postbacks.js` faisait `SELECT telegram_id FROM users WHERE id = ?` en supposant que `users.referrer_id` était un **UUID**
+- Or le bot stocke `users.referrer_id` comme **telegram_id string** (ex: `"2120696159"`)
+- Donc même si Ridwone avait fait `FIRST_DEPOSIT`, l'attribution du ticket aurait échoué silencieusement
+- **Corrigé** : lookup désormais tente UUID puis telegram_id, avec protection anti-self-referral
+
+## 3. Confirmation : aucune attribution réelle de coupons
+
+| Vérification | Résultat |
+|---|---|
+| Table `reward_claims` existe ? | ✅ Oui (créée par la migration) |
+| Lignes dans `reward_claims` ? | ❌ **0 ligne** |
+| Code qui `INSERT INTO reward_claims` ? | ❌ **Aucun** (grep négatif dans `src/`) |
+| Code qui lit `reward_claims` ? | ❌ **Aucun** |
+| Fournisseur de coupons connecté ? | ❌ **Aucun** |
+| Logique de distribution automatique ? | ❌ **Aucune** |
+
+**Conclusion** : `reward_claims` est une table vide, créée par anticipation mais **jamais utilisée**. Aucun coupon, voucher ou récompense financière n'est distribué automatiquement. Les tickets restent des points internes sans valeur monétaire.
+
+## 4. Conditions d'éligibilité aux récompenses
+
+Aucune récompense ne peut être distribuée actuellement. Si vous activez `reward_claims` plus tard, les conditions minimum devraient être (selon votre cahier des charges) :
+- L'utilisateur doit avoir au moins 1 ticket (`tickets_balance >= 1`)
+- Le ticket doit provenir d'un `FIRST_DEPOSIT` confirmé (pas d'inscription seule)
+- L'attribution doit être **manuelle** via une route admin dédiée
+- Aucune distribution automatique sans validation administrative
+
+## 5. Cause exacte du statut "non activé" de votre compte parrain
+
+**Votre compte utilisateur est techniquement activé** : `status=approved`, `registration_status=registered`, `deposit_status=deposited`. Donc le bot affiche "Compte validé" dans `/account_status`.
+
+**Ce qui donne l'impression "non activé"** :
+- Votre compte n'est **pas dans `referral_reward_accounts`** (0 ligne)
+- Votre `/referral` affiche `tickets_balance=0`, `weekly_rank=null`, `badges=[]`
+- Votre `/badges` affiche les 5 badges verrouillés
+
+**Pourquoi `referral_reward_accounts` est vide** :
+- Cette table n'est remplie que par `awardQualifiedReferral()`
+- Cette fonction n'est appelée que sur `FIRST_DEPOSIT` d'un de vos filleuls
+- Aucun de vos filleuls n'a fait `FIRST_DEPOSIT` côté 1Win
+- Donc la fonction n'a jamais été déclenchée pour vous
+
+**Ce n'est pas un bug** : c'est le comportement attendu. Votre "statut parrain" s'activera automatiquement dès qu'un vrai filleul qualifiera.
+
+## 6. Tables et fonctions concernées
+
+| Table / Fonction | Rôle |
+|---|---|
+| `users` | Stocke `referrer_id` (telegram_id string, comportement bot actuel) |
+| `referrals` | Table legacy — uniquement 1 ligne auto-parrainage, jamais alimentée par le code actuel |
+| `affiliate_events` | Postbacks 1Win bruts (REGISTRATION, FIRST_DEPOSIT) |
+| `referral_reward_accounts` | Solde tickets + badges du parrain |
+| `referral_reward_events` | Journal idempotent des qualifications (event_key unique) |
+| `user_badges` | Badges attribués (UNIQUE sur `user_id, badge_code, period_id`) |
+| `leaderboard_periods` | Périodes hebdo (1 seule active à la fois) |
+| `leaderboard_entries` | Entries par utilisateur par période |
+| `awardQualifiedReferral()` | Fonction clé — appelée par `postbacks.js` sur FIRST_DEPOSIT |
+| `awardApplicableBadges()` | Calcule et attribue les badges `first_share` / `first_referral` / `active_referrer` / `ambassador` |
+| `closeWeeklyPeriod()` | Attribue `top_three` aux 3 premiers à la clôture |
+
+## 7. Corrections effectuées (Worker uniquement)
+
+### Bug corrigé dans `postbacks.js`
+
+**Avant** : lookup uniquement par UUID (`WHERE id = ?`) — échouait silencieusement car le bot stocke `referrer_id` comme telegram_id string.
+
+**Après** :
+1. Tentative par UUID (legacy)
+2. Si échec, tentative par telegram_id (comportement actuel du bot)
+3. **Anti-self-referral** : si parrain == filleul, attribution du ticket bloquée
+4. Anti-doublon conservé via `event_key` unique
+
+**Aucune autre modification** : je n'ai pas touché à `_start.js`, `@.js`, `_referral.js`, `_leaderboard.js`, `_badges.js`, ni à la logique des signaux/jeux/crédits.
+
+**Version déployée** : `b3fc22d9-8e04-4513-aa63-0bee07c9c05b` à `https://dns25-bot.dns25.workers.dev`
+
+## 8. Tests réalisés et résultats
+
+| Test | Résultat |
+|---|---|
+| Filleul avec `referrer_id` telegram_id → FIRST_DEPOSIT → ticket attribué | ✅ |
+| Event enregistré avec `event_key = qualified:{owner}:{referred}` | ✅ |
+| Badges `first_share` + `first_referral` attribués au parrain | ✅ |
+| Parrain apparaît dans leaderboard à rang 1 | ✅ |
+| `/api/bot/referral/:id` renvoie `rewards.tickets_balance=1`, `weekly_rank=1`, `badges=[first_share, first_referral]` | ✅ |
+| Self-referral bloqué (aucun ticket, aucun badge, aucun event) | ✅ |
+| Doublon `event_key` → `duplicate:true`, pas de 2e ticket | ✅ |
+| Privacy : aucune fuite (email/phone/token/one_win_user_id) | ✅ |
+| Données admin réelles NON touchées pendant les tests | ✅ |
+| **TOTAL** | **23/23 passés** |
+
+## 9. Actions restantes
+
+### Côté bot (à faire par vous, pas par moi)
+
+**Aucune modification de code nécessaire.** Le bot envoie déjà `referrer_id` comme telegram_id string, et le Worker le gère désormais correctement.
+
+### Côté 1Win (à faire par vous)
+
+**Vérifiez** que Ridwone (et tout futur filleul) reçoit bien un postback `REGISTRATION` puis `FIRST_DEPOSIT` après son dépôt réel. Sans postback 1Win entrant, le système ne peut pas savoir qu'une qualification a eu lieu.
+
+### Décisions de design à confirmer (au choix)
+
+1. **`first_share` doit-il se déclencher plus tôt ?** Actuellement, il faut un `FIRST_DEPOSIT` du filleul. Si vous voulez qu'il se déclenche au moment où quelqu'un rejoint via votre lien (REGISTRATION), il faudrait ajouter un événement `share_confirmed` dans `postbacks.js`. **Dites-moi si je l'ajoute.**
+
+2. **Table `referrals` legacy** : elle contient 1 ligne (auto-parrainage admin → admin). Souhaitez-vous que je la nettoie (supprimer uniquement cette ligne auto-parrainage) ou que je l'ignore ?
+
+3. **Cron hebdo pour clôture stricte** : actuellement la clôture est paresseuse (au premier appel API après expiration). Voulez-vous que j'ajoute un cron `0 0 * * 1` dans `wrangler.toml` pour clôturer strictement chaque lundi à 00:00 UTC ?
+
+Aucune de ces 3 actions n'est faite sans votre feu vert.
